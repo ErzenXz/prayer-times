@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 
 interface PrayerTimes {
   [key: string]: string;
@@ -30,6 +30,71 @@ export function usePrayerTimes() {
     enabled: false,
     minutesBefore: 5,
   });
+
+  // References to track current state across intervals
+  const lastPrayerRef = useRef<string | null>(null);
+  const syncTimeRetryCount = useRef<number>(0);
+  const timeSources = useRef<string[]>([
+    "https://worldtimeapi.org/api/ip",
+    "https://timeapi.io/api/Time/current/zone?timeZone=UTC",
+    "https://www.timeapi.io/api/Time/current/coordinate",
+  ]);
+
+  // Need to define these functions before they're used in dependencies
+
+  // Play adhan sound - defining early to avoid circular dependencies
+  const playAdhan = useCallback((prayerName: string) => {
+    const audioEnabled = localStorage.getItem("audioEnabled") !== "false";
+    if (!audioEnabled) return;
+
+    setAudioPlaying(true);
+
+    const adhanFiles = [
+      "/adhan1.mp3",
+      "/adhan2.mp3",
+      "/adhan3.mp3",
+      "/adhan4.mp3",
+    ];
+    const randomIndex = Math.floor(Math.random() * adhanFiles.length);
+    const audioFile = adhanFiles[randomIndex];
+
+    const audio = new Audio(audioFile);
+    audio.preload = "auto";
+
+    audio.addEventListener("canplaythrough", () => {
+      console.log("Audio loaded and ready to play - " + audioFile);
+      audio.play().catch((err) => console.error("Error playing audio:", err));
+    });
+
+    audio.addEventListener("ended", () => {
+      setAudioPlaying(false);
+    });
+
+    // Show notification if supported
+    if ("Notification" in window && Notification.permission === "granted") {
+      const notification = new Notification("Prayer Time", {
+        body: `It's time for ${prayerName} prayer.`,
+        icon: "/favicon.ico",
+        tag: "prayer-time",
+      });
+    }
+  }, []);
+
+  // Send reminder notification - defining early to avoid circular dependencies
+  const sendReminderNotification = useCallback(
+    (prayerName: string, minutesLeft: number) => {
+      if ("Notification" in window && Notification.permission === "granted") {
+        const notification = new Notification("Prayer Time Reminder", {
+          body: `${prayerName} prayer will start in ${minutesLeft} minute${
+            minutesLeft === 1 ? "" : "s"
+          }.`,
+          icon: "/favicon.ico",
+          tag: "prayer-reminder",
+        });
+      }
+    },
+    []
+  );
 
   // Function to set location (country and city)
   const setLocation = useCallback((countryCode: string, cityCode: string) => {
@@ -67,38 +132,103 @@ export function usePrayerTimes() {
     []
   );
 
-  // Function to sync time with server
+  // Function to sync time with multiple server sources for redundancy
   const syncTime = useCallback(async () => {
     try {
-      // Use local time as fallback in case API fails
+      // Store local time as fallback
       const localTime = new Date().getTime();
 
-      // Try to fetch time from API with timeout
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 5000); // 5 second timeout
+      // Try multiple time sources with fallback
+      let serverTime: number | null = null;
+      let timeDifference = 0;
+      let sourceIndex = syncTimeRetryCount.current % timeSources.current.length;
 
-      const response = await fetch("https://worldtimeapi.org/api/ip", {
-        signal: controller.signal,
-      }).catch((err) => {
-        console.log("Using local time due to API error");
-        return null;
-      });
+      // Use the current source based on retry count
+      const timeSource = timeSources.current[sourceIndex];
 
-      clearTimeout(timeoutId);
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 3000); // 3 second timeout
 
-      if (!response || !response.ok) {
-        return localTime;
+        let response;
+
+        if (timeSource.includes("worldtimeapi")) {
+          response = await fetch(timeSource, { signal: controller.signal });
+          if (response.ok) {
+            const data = await response.json();
+            serverTime = new Date(data.utc_datetime).getTime();
+          }
+        } else if (timeSource.includes("timeZone")) {
+          response = await fetch(timeSource, { signal: controller.signal });
+          if (response.ok) {
+            const data = await response.json();
+            serverTime = new Date(data.dateTime).getTime();
+          }
+        } else if (timeSource.includes("coordinate")) {
+          // Try to get user's coordinates for more accurate time
+          let latitude = 0,
+            longitude = 0;
+          if (navigator.geolocation) {
+            const position = await new Promise<GeolocationPosition>(
+              (resolve, reject) => {
+                navigator.geolocation.getCurrentPosition(resolve, reject, {
+                  timeout: 2000,
+                  maximumAge: 600000, // 10 minutes
+                });
+              }
+            ).catch(() => null);
+
+            if (position) {
+              latitude = position.coords.latitude;
+              longitude = position.coords.longitude;
+            }
+          }
+
+          response = await fetch(
+            `${timeSource}?latitude=${latitude}&longitude=${longitude}`,
+            { signal: controller.signal }
+          );
+
+          if (response.ok) {
+            const data = await response.json();
+            serverTime = new Date(data.dateTime).getTime();
+          }
+        }
+
+        clearTimeout(timeoutId);
+      } catch (err) {
+        console.log(`Failed to fetch time from ${timeSource}`);
+        syncTimeRetryCount.current++;
+
+        // Try next time source immediately if this one failed
+        if (syncTimeRetryCount.current < timeSources.current.length * 3) {
+          return syncTime();
+        }
       }
 
-      const data = await response.json();
-      const serverTime = new Date(data.utc_datetime);
-      const clientTime = new Date();
-      const timeDifference = serverTime.getTime() - clientTime.getTime();
+      if (serverTime) {
+        const clientTime = new Date().getTime();
+        timeDifference = serverTime - clientTime;
 
-      setTimeDiff(timeDifference);
-      return serverTime.getTime();
+        // Only apply time difference if it's significant (>1 second)
+        if (Math.abs(timeDifference) > 1000) {
+          console.log(`Time synchronized. Difference: ${timeDifference}ms`);
+          setTimeDiff(timeDifference);
+
+          // Store time diff in localStorage for service worker
+          localStorage.setItem("timeDiff", timeDifference.toString());
+
+          // Reset retry count on success
+          syncTimeRetryCount.current = 0;
+
+          return serverTime;
+        }
+      }
+
+      // Fallback to local time if all else fails
+      return localTime;
     } catch (error) {
-      console.log("Using local time due to sync error");
+      console.log("Using local time due to sync error:", error);
       return new Date().getTime();
     }
   }, []);
@@ -211,35 +341,71 @@ export function usePrayerTimes() {
   }, [country, city]);
 
   // Register service worker for background notifications
-  const registerBackgroundSync = useCallback((times: PrayerTimes) => {
-    if ("serviceWorker" in navigator && "PushManager" in window) {
-      // Store prayer times in localStorage for service worker access
-      localStorage.setItem("prayerTimes", JSON.stringify(times));
-      localStorage.setItem("lastUpdated", new Date().toISOString());
+  const registerBackgroundSync = useCallback(
+    (times: PrayerTimes) => {
+      if ("serviceWorker" in navigator) {
+        // Store prayer times in localStorage for service worker access
+        localStorage.setItem("prayerTimes", JSON.stringify(times));
+        localStorage.setItem("lastUpdated", new Date().toISOString());
 
-      // Register or update service worker
-      navigator.serviceWorker
-        .register("/service-worker.js")
-        .then((registration) => {
-          console.log(
-            "Service Worker registered with scope:",
-            registration.scope
-          );
-        })
-        .catch((error) => {
-          console.error("Service Worker registration failed:", error);
+        // Send data directly to service worker if already registered
+        navigator.serviceWorker.ready.then((registration) => {
+          navigator.serviceWorker.controller?.postMessage({
+            type: "STORE_DATA",
+            key: "prayerTimes",
+            value: JSON.stringify(times),
+          });
+
+          // Also send reminder settings
+          navigator.serviceWorker.controller?.postMessage({
+            type: "STORE_DATA",
+            key: "reminderSettings",
+            value: JSON.stringify(reminderSettings),
+          });
+
+          // Send time difference to service worker
+          navigator.serviceWorker.controller?.postMessage({
+            type: "STORE_DATA",
+            key: "timeDiff",
+            value: timeDiff.toString(),
+          });
         });
-    }
-  }, []);
 
-  // Calculate next prayer and time until next prayer
+        // Register or update service worker
+        navigator.serviceWorker
+          .register("/service-worker.js")
+          .then((registration) => {
+            console.log(
+              "Service Worker registered with scope:",
+              registration.scope
+            );
+          })
+          .catch((error) => {
+            console.error("Service Worker registration failed:", error);
+          });
+      }
+    },
+    [reminderSettings, timeDiff]
+  );
+
+  // Calculate next prayer and time until next prayer with high precision
   const calculateNextPrayer = useCallback(() => {
     if (!prayerTimes) return;
 
+    // Get current time with server time adjustment
     const now = new Date(Date.now() + timeDiff);
+
+    // Calculate current time in milliseconds since start of day
     const currentHour = now.getHours();
     const currentMinute = now.getMinutes();
     const currentSecond = now.getSeconds();
+    const currentMs = now.getMilliseconds();
+
+    const currentTimeMs =
+      currentHour * 3600000 +
+      currentMinute * 60000 +
+      currentSecond * 1000 +
+      currentMs;
 
     // Format current time
     setCurrentTime(
@@ -249,143 +415,113 @@ export function usePrayerTimes() {
       )}:${String(currentSecond).padStart(2, "0")}`
     );
 
-    // Find the next prayer
-    let nextPrayerName: string | null = null;
-    let minDiff = Infinity;
-    let minutesUntilNextPrayer = Infinity;
+    // Convert prayer times to milliseconds since start of day for more accurate comparison
+    const prayerTimesMs: { [key: string]: number } = {};
+    let earliestPrayer: string | null = null;
+    let earliestTime = Infinity;
 
     Object.entries(prayerTimes).forEach(([name, timeStr]) => {
+      if (!timeStr) return;
+
       const [prayerHour, prayerMinute] = timeStr.split(":").map(Number);
+      const prayerTimeMs = prayerHour * 3600000 + prayerMinute * 60000;
 
-      // Calculate time difference in minutes
-      let diff =
-        (prayerHour - currentHour) * 60 + (prayerMinute - currentMinute);
+      prayerTimesMs[name] = prayerTimeMs;
 
-      // If the prayer time has passed today, add 24 hours
-      if (diff < 0) {
-        diff += 24 * 60;
-      }
-
-      if (diff < minDiff) {
-        minDiff = diff;
-        nextPrayerName = name;
-        minutesUntilNextPrayer = diff;
+      // Find earliest prayer in the day
+      if (prayerTimeMs < earliestTime) {
+        earliestTime = prayerTimeMs;
+        earliestPrayer = name;
       }
     });
 
-    setNextPrayer(nextPrayerName);
+    // Find the next prayer
+    let nextPrayerName: string | null = null;
+    let nextPrayerTimeMs = Infinity;
+    let minDiffMs = Infinity;
 
-    // Calculate time until next prayer
+    // First, check for prayers later today
+    Object.entries(prayerTimesMs).forEach(([name, timeMs]) => {
+      if (timeMs > currentTimeMs && timeMs - currentTimeMs < minDiffMs) {
+        minDiffMs = timeMs - currentTimeMs;
+        nextPrayerName = name;
+        nextPrayerTimeMs = timeMs;
+      }
+    });
+
+    // If no prayer found later today, use the earliest prayer tomorrow
+    if (!nextPrayerName && earliestPrayer) {
+      nextPrayerName = earliestPrayer;
+      nextPrayerTimeMs = prayerTimesMs[earliestPrayer];
+      minDiffMs = nextPrayerTimeMs + (24 * 3600000 - currentTimeMs);
+    }
+
+    // Only update UI if the next prayer changed
+    if (nextPrayerName !== lastPrayerRef.current) {
+      setNextPrayer(nextPrayerName);
+      lastPrayerRef.current = nextPrayerName;
+      setReminderSent(false); // Reset reminder when prayer changes
+    }
+
+    // Calculate time until next prayer with high precision
     if (nextPrayerName) {
+      let msUntilNextPrayer = minDiffMs;
+
+      // Handle edge case when prayer is tomorrow
+      if (msUntilNextPrayer > 24 * 3600000) {
+        msUntilNextPrayer = msUntilNextPrayer % (24 * 3600000);
+      }
+
+      const hoursLeft = Math.floor(msUntilNextPrayer / 3600000);
+      const minutesLeft = Math.floor((msUntilNextPrayer % 3600000) / 60000);
+      const secondsLeft = Math.floor((msUntilNextPrayer % 60000) / 1000);
+
+      const formattedTime = `${String(hoursLeft).padStart(2, "0")}:${String(
+        minutesLeft
+      ).padStart(2, "0")}:${String(secondsLeft).padStart(2, "0")}`;
+
+      setTimeUntilNextPrayer(formattedTime);
+
+      // Extract prayer time components
       const [nextHour, nextMinute] = prayerTimes[nextPrayerName]
         .split(":")
         .map(Number);
 
-      let diffHours = nextHour - currentHour;
-      let diffMinutes = nextMinute - currentMinute;
-      let diffSeconds = 0 - currentSecond;
+      // Check if it's prayer time with high precision
+      const isPrayerTime =
+        msUntilNextPrayer === 0 ||
+        (hoursLeft === 0 && minutesLeft === 0 && secondsLeft === 0);
 
-      if (diffSeconds < 0) {
-        diffSeconds += 60;
-        diffMinutes--;
-      }
-
-      if (diffMinutes < 0) {
-        diffMinutes += 60;
-        diffHours--;
-      }
-
-      if (diffHours < 0) {
-        diffHours += 24;
-      }
-
-      setTimeUntilNextPrayer(
-        `${String(diffHours).padStart(2, "0")}:${String(diffMinutes).padStart(
-          2,
-          "0"
-        )}:${String(diffSeconds).padStart(2, "0")}`
-      );
-
-      // Check if it's prayer time and play adhan
-      if (
-        diffHours === 0 &&
-        diffMinutes === 0 &&
-        diffSeconds === 0 &&
-        !audioPlaying
-      ) {
+      if (isPrayerTime && !audioPlaying) {
         playAdhan(nextPrayerName);
         setReminderSent(false); // Reset reminder flag for next prayer
       }
 
-      // Check if it's time for reminder
+      // Check if it's time for reminder with high precision
+      const msUntilReminderTime = reminderSettings.minutesBefore * 60000;
+
       if (
         reminderSettings.enabled &&
         !reminderSent &&
-        diffHours === 0 &&
-        diffMinutes <= reminderSettings.minutesBefore &&
-        diffMinutes > 0
+        msUntilNextPrayer > 0 &&
+        msUntilNextPrayer <= msUntilReminderTime
       ) {
-        sendReminderNotification(nextPrayerName, diffMinutes);
+        const minutesLeft = Math.ceil(msUntilNextPrayer / 60000);
+        sendReminderNotification(nextPrayerName, minutesLeft);
         setReminderSent(true);
       }
     } else {
       setTimeUntilNextPrayer(null);
     }
-  }, [prayerTimes, timeDiff, audioPlaying, reminderSettings, reminderSent]);
-
-  // Send reminder notification
-  const sendReminderNotification = useCallback(
-    (prayerName: string, minutesLeft: number) => {
-      if ("Notification" in window && Notification.permission === "granted") {
-        const notification = new Notification("Prayer Time Reminder", {
-          body: `${prayerName} prayer will start in ${minutesLeft} minute${
-            minutesLeft === 1 ? "" : "s"
-          }.`,
-          icon: "/favicon.ico",
-          tag: "prayer-reminder",
-        });
-      }
-    },
-    []
-  );
-
-  // Play adhan sound
-  const playAdhan = useCallback((prayerName: string) => {
-    const audioEnabled = localStorage.getItem("audioEnabled") !== "false";
-    if (!audioEnabled) return;
-
-    setAudioPlaying(true);
-
-    const adhanFiles = [
-      "/adhan1.mp3",
-      "/adhan2.mp3",
-      "/adhan3.mp3",
-      "/adhan4.mp3",
-    ];
-    const randomIndex = Math.floor(Math.random() * adhanFiles.length);
-    const audioFile = adhanFiles[randomIndex];
-
-    const audio = new Audio(audioFile);
-    audio.preload = "auto";
-
-    audio.addEventListener("canplaythrough", () => {
-      console.log("Audio loaded and ready to play - " + audioFile);
-      audio.play().catch((err) => console.error("Error playing audio:", err));
-    });
-
-    audio.addEventListener("ended", () => {
-      setAudioPlaying(false);
-    });
-
-    // Show notification if supported
-    if ("Notification" in window && Notification.permission === "granted") {
-      const notification = new Notification("Prayer Time", {
-        body: `It's time for ${prayerName} prayer.`,
-        icon: "/favicon.ico",
-        tag: "prayer-time",
-      });
-    }
-  }, []);
+  }, [
+    prayerTimes,
+    timeDiff,
+    audioPlaying,
+    reminderSettings,
+    reminderSent,
+    playAdhan,
+    sendReminderNotification,
+  ]);
 
   // Request notification permission
   useEffect(() => {
@@ -408,12 +544,13 @@ export function usePrayerTimes() {
     }
   }, []);
 
-  // Sync time on component mount
+  // Initial time sync and set up periodic sync
   useEffect(() => {
+    // Do immediate time sync on component mount
     syncTime();
 
-    // Sync time every 5 minutes
-    const syncInterval = setInterval(syncTime, 5 * 60 * 1000);
+    // Sync time every 30 minutes (more frequent than before)
+    const syncInterval = setInterval(syncTime, 30 * 60 * 1000);
 
     return () => clearInterval(syncInterval);
   }, [syncTime]);
@@ -425,16 +562,28 @@ export function usePrayerTimes() {
     }
   }, [country, city, fetchPrayerTimes]);
 
-  // Update time every second
+  // Update prayer times calculation with shorter interval for more accuracy
   useEffect(() => {
-    const interval = setInterval(() => {
-      calculateNextPrayer();
-    }, 1000);
+    // Use requestAnimationFrame for smoother updates
+    let frameId: number;
+    let lastUpdate = 0;
 
-    return () => clearInterval(interval);
+    const updateFrame = (timestamp: number) => {
+      // Update at most every 500ms for efficiency
+      if (timestamp - lastUpdate >= 500) {
+        calculateNextPrayer();
+        lastUpdate = timestamp;
+      }
+
+      frameId = requestAnimationFrame(updateFrame);
+    };
+
+    frameId = requestAnimationFrame(updateFrame);
+
+    return () => cancelAnimationFrame(frameId);
   }, [calculateNextPrayer]);
 
-  // Set up periodic background refresh
+  // Set up periodic background refresh for prayer times
   useEffect(() => {
     // Refresh prayer times every 6 hours
     const refreshInterval = setInterval(() => {
@@ -443,6 +592,15 @@ export function usePrayerTimes() {
 
     return () => clearInterval(refreshInterval);
   }, [fetchPrayerTimes]);
+
+  // Update service worker whenever prayer times or settings change
+  useEffect(() => {
+    if (prayerTimes && "serviceWorker" in navigator) {
+      navigator.serviceWorker.ready.then(() => {
+        registerBackgroundSync(prayerTimes);
+      });
+    }
+  }, [prayerTimes, reminderSettings, registerBackgroundSync]);
 
   return {
     prayerTimes,
