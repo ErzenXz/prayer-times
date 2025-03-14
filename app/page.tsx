@@ -69,17 +69,6 @@ export default function Home() {
         .register("/service-worker.js")
         .then((registration) => {
           console.log("Service Worker registered with scope:", registration.scope)
-
-          // Register for background sync if supported
-          if ("sync" in registration) {
-            navigator.serviceWorker.ready.then((registration) => {
-              // Type assertion for Background Sync API
-              ;(registration as any).sync
-                .register("sync-prayer-times")
-                .then(() => console.log("Background sync registered!"))
-                .catch((err: any) => console.error("Background sync registration failed:", err))
-            })
-          }
         })
         .catch((error) => {
           console.error("Service Worker registration failed:", error)

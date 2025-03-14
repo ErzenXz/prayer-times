@@ -282,9 +282,6 @@ export function usePrayerTimes() {
           setPrayerTimes(times);
           setLoading(false);
 
-          // Register service worker for background notifications
-          registerBackgroundSync(times);
-
           return;
         }
       } catch (error) {
@@ -331,62 +328,11 @@ export function usePrayerTimes() {
 
       setPrayerTimes(times);
       setLoading(false);
-
-      // Register service worker for background notifications
-      registerBackgroundSync(times);
     } catch (error) {
       console.error("Error fetching prayer times:", error);
       setLoading(false);
     }
   }, [country, city]);
-
-  // Register service worker for background notifications
-  const registerBackgroundSync = useCallback(
-    (times: PrayerTimes) => {
-      if ("serviceWorker" in navigator) {
-        // Store prayer times in localStorage for service worker access
-        localStorage.setItem("prayerTimes", JSON.stringify(times));
-        localStorage.setItem("lastUpdated", new Date().toISOString());
-
-        // Send data directly to service worker if already registered
-        navigator.serviceWorker.ready.then((registration) => {
-          navigator.serviceWorker.controller?.postMessage({
-            type: "STORE_DATA",
-            key: "prayerTimes",
-            value: JSON.stringify(times),
-          });
-
-          // Also send reminder settings
-          navigator.serviceWorker.controller?.postMessage({
-            type: "STORE_DATA",
-            key: "reminderSettings",
-            value: JSON.stringify(reminderSettings),
-          });
-
-          // Send time difference to service worker
-          navigator.serviceWorker.controller?.postMessage({
-            type: "STORE_DATA",
-            key: "timeDiff",
-            value: timeDiff.toString(),
-          });
-        });
-
-        // Register or update service worker
-        navigator.serviceWorker
-          .register("/service-worker.js")
-          .then((registration) => {
-            console.log(
-              "Service Worker registered with scope:",
-              registration.scope
-            );
-          })
-          .catch((error) => {
-            console.error("Service Worker registration failed:", error);
-          });
-      }
-    },
-    [reminderSettings, timeDiff]
-  );
 
   // Calculate next prayer and time until next prayer with high precision
   const calculateNextPrayer = useCallback(() => {
@@ -592,15 +538,6 @@ export function usePrayerTimes() {
 
     return () => clearInterval(refreshInterval);
   }, [fetchPrayerTimes]);
-
-  // Update service worker whenever prayer times or settings change
-  useEffect(() => {
-    if (prayerTimes && "serviceWorker" in navigator) {
-      navigator.serviceWorker.ready.then(() => {
-        registerBackgroundSync(prayerTimes);
-      });
-    }
-  }, [prayerTimes, reminderSettings, registerBackgroundSync]);
 
   return {
     prayerTimes,
